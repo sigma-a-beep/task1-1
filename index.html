@@ -1,0 +1,730 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Инструкция 1</title>
+    <style>
+        body {
+            font-family: monospace;
+            white-space: pre-wrap;
+            background-color: #f9f9f9;
+            padding: 2em;
+            color: #111;
+        }
+    </style>
+</head>
+<body>
+<pre>
+
+111111
+
+hostnamectl hostname hq-srv.au-team.irpo 
+hostnamectl hostname hq-rtr.au-team.irpo 
+hostnamectl hostname isp.au-team.irpo 
+hostnamectl hostname br-rtr.au-team.irpo 
+hostnamectl hostname br-srv.au-team.irpo 
+hostnamectl set-hostname hq-cli.au-team.irpo
+_________________________________________________
+
+1.БАЗА
+HQ-RTR ens33:
+172.16.4.2/28
+172.16.4.1
+10.39.0.1
+ens34 vlan.100
+192.168.100.1/26
+ens34 vlan.200:
+192.168.200.1/28
+ens34.vlan999:
+192.168.99.1/29
+
+HQ-SRV ens33.vlan100:
+192.168.100.10/26
+192.168.100.1
+10.39.0.1
+
+BR-RTR ens33:
+172.16.5.2/28
+172.16.5.1
+10.39.0.1
+ens34:
+172.30.100.1/27
+
+BR-SRV ens33:
+172.30.100.10/27
+172.30.100.1
+10.39.0.1
+
+ISP ens34:
+172.16.4.1/28
+ens35:
+172.16.5.1/28
+
+HQ-CLI:
+ens33.vlan200
+
+ПЕРЕЗАГРУЖАЕМ ЧЕРЕЗ "АКТИВИРОВАТЬ ПОДКЛ"
+
+ISP/BR-RTR/HQ-RTR:
+echo net.ipv4.ip_forward=1 >> /etc/sysctl.conf 
+sysctl -p
+_________________________________________________
+
+2.НАСТРОЙКА ISP
+dnf install iptables-services -y
+systemctl enable --now iptables
+iptables -F
+iptables -A FORWARD -s 172.16.0.0/16 -j ACCEPT 
+iptables -A FORWARD -d 172.16.0.0/16 -j ACCEPT 
+iptables -t nat -A POSTROUTING -o ens33 -s 172.16.0.0/16 -j MASQUERADE 
+systemctl stop firewalld 
+systemctl disable firewalld 
+iptables-save 
+iptables-save > /etc/sysconfig/iptables 
+
+ПРОВЕРЯЕМ ПИНГИ НА 10.39.0.1 С HQ-RTR и BR-RTR 
+_________________________________________________
+
+3.СОЗДАНИЕ ЛОКАЛЬНЫХ УЧЕТНЫХ ЗАПИСЕЙ HQ-SRV/BR-SRV 
+
+useradd -m -U -s /bin/bash -u 1010 sshuser 
+passwd sshuser 
+P@ssw0rd 
+P@ssw0rd 
+echo sshuser ALL=(ALL) NOPASSWD: ALL >> /etc/sudoers 
+
+СОЗДАНИЕ ЛОКАЛЬНЫХ УЧЕТНЫХ ЗАПИСЕЙ HQ-RTR/BR-RTR
+
+useradd -m -U -s /bin/bash net_admin 
+passwd net_admin 
+P@$$w0rd 
+P@$$w0rd 
+echo net_admin ALL=(ALL) NOPASSWD: ALL >> /etc/sudoers
+________________________________________________________
+
+5.SSH HQ-SRV/BR-SRV:
+echo Authorized access only > /etc/ssh/banner.txt
+
+nano /etc/ssh/sshd_config 
+Port 2024 
+AllowUsers sshuser 
+MaxAuthTries 2 
+Banner /etc/ssh/banner.txt
+systemctl restart sshd
+semanage port -m -t ssh_port_t -p tcp 2024
+!наоборот
+
+ПРОВЕРКА
+ssh -l sshuser 172.30.100.10 -p 2024 
+ssh -l sshuser 192.168.100.10 -p 2024 
+____________________________________________________________
+
+6.IP-ТУННЕЛЬ HQ-RTR: 
+HQ-RTR
+ИМЯ tun0
+УСТР tun0
+РЕЖИМ GRE
+РОДИТ ens33
+ЛОКАЛ IP 172.16.4.2
+УДАЛ IP 172.16.5.2
+АДРЕС 10.10.10.1/30
+
+IP-ТУННЕЛЬ BR-RTR: 
+ИМЯ tun0
+УСТР tun0
+РЕЖИМ GRE
+РОДИТ ens33
+ЛОКАЛ IP 172.16.5.2
+УДАЛ IP 172.16.4.2
+АДРЕС 10.10.10.2/30
+
+ПОСЛЕ ЭТОГО НА ОБОИХ РОУТЕРАХ ПИШЕМ: 
+nmcli connection modify tun0 ip-tunnel.ttl 64
+И перезапускаем tunnel через nmtui (выключаем и включаем 
+интерфейс) 
+Проверяем пинги с двух роутеров на 10.10.10.1 и 10.10.10.2
+_____________________________________________________________
+
+7.ДИНАМИЧЕСКАЯ МАРШРУТИЗАЦИЯ
+
+HQ-RTR 
+dnf install frr 
+systemctl enable --now frr 
+nano /etc/frr/daemons  
+заменить no на yes в ospfd=yes 
+systemctl restart frr 
+
+vtysh 
+ДАЛЕЕ РАБОТА КАК В CISCO 
+conf t 
+router ospf
+network 192.168.100.0/26 area 0
+network 192.168.200.0/28 area 0 
+network 192.168.99.0/29 area 0
+network 10.10.10.0/30 area 0 
+ospf router-id 172.16.4.2
+passive-interface ens33
+ip ospf passive
+passive-interface ens34
+passive-interface ens35
+area 0 authentication 
+exit 
+interface tun0 
+ip ospf authentication 
+ip ospf authentication-key P@ssw0rd 
+do wr
+exit
+
+BR-RTR 
+dnf install frr 
+systemctl enable --now frr 
+nano /etc/frr/daemons  
+заменить no на yes в ospfd=yes 
+systemctl restart frr 
+
+vtysh 
+ДАЛЕЕ РАБОТА КАК В CISCO 
+conf t 
+router ospf
+network 172.30.100.10/27 area 0
+network 10.10.10.0/30 area 0
+ospf router-id 172.16.5.2
+passive-interface ens33
+ip ospf passive
+passive-interface ens34
+area 0 authentication 
+exit 
+interface tun0 
+ip ospf authentication 
+ip ospf authentication-key P@ssw0rd 
+do wr 
+exit
+_______________________________________________________
+
+8.ДИНАМИЧЕСКАЯ ТРАНСЛЯЦИЯ АДРЕСОВ
+
+НА HQ-RTR И BR-RTR: 
+systemctl --now enable firewalld 
+firewall-cmd --set-default-zone=trusted 
+firewall-cmd --zone=trusted --add-masquerade --permanent 
+systemctl restart firewalld
+________________________________________________________
+
+9.ДИНАМИЧЕСКАЯ КОНФИГУРАЦИЯ ХОСТОВ
+
+НА HQ-RTR:
+dnf install dhcp-server 
+nano /etc/dhcp/dhcpd.conf 
+Пишем это в файле: 
+subnet 192.168.200.0 netmask 255.255.255.240 { 
+	range 192.168.200.2 192.168.200.14; 
+	option routers 192.168.200.1; 
+	option broadcast-address 192.168.200.15; 
+	option domain-name-servers 192.168.100.10; 
+	option domain-name au-team.irpo; 
+}
+
+systemctl enable --now dhcpd 
+dhcpd
+
+ПРОВЕРЯЕМ НА HQ-RTR, ЧТО ЕСТЬ ЗАПИСЬ В ФАЙЛЕ, 
+УКАЗЫВАЮЩАЯ НА ПОЛУЧЕНИЕ АДРЕС КЛИЕНТОМ: 
+cat /var/lib/dhcpd/dhcpd.leases 
+systemctl restard dhcpd
+_________________________________________________________
+
+10.НАСТРОЙКА DNS
+
+НА HQ-SRV:
+dnf install bind 
+nano /etc/named.conf 
+
+ИЗМЕНИТЬ СТРОЧКИ:
+listen-on port 53 { any; };
+allow-query { any; };
+forwarders { 10.39.0.1; };
+
+И В КОНЦЕ ДОБАВИТЬ:
+
+zone au-team.irpo IN {
+	type master;
+	file /opt/dns/au-team.irpo;
+};
+
+zone 100.168.192.in-addr.arpa IN {
+	type master;
+	file /opt/dns/100.168.192.in-addr.arpa;
+};
+
+zone 200.168.192.in-addr.arpa IN {
+	type master;
+	file /opt/dns/200.168.192.in-addr.arpa;
+};
+
+________________________________________________________
+
+mkdir /opt/dns 
+cd /opt/dns 
+cp /var/named/named.empty au-team.irpo
+__________________________________________________________
+
+nano au-team.irpo
+
+$TTL 3H		
+au-team.irpo.	IN	SOA	au-team.irpo. au-team.irpo. (
+					1	; serial
+					1D	; refresh
+					1H	; retry
+					1W	; expire
+					3H )	; minimum
+
+	NS	hq-srv.au-team.irpo.
+hq-rtr	A	192.168.100.1
+hq-rtr	A	192.168.200.1
+br-rtr	A	172.30.100.1
+hq-srv	A	192.168.100.10
+hq-cli	A	192.168.200.2
+br-srv	A	172.30.100.10
+wiki	CNAME	hq-rtr.au-team.irpo.
+moodle	CNAME	hq-rtr.au-team.irpo.
+________________________________________________________
+
+cp /var/named/named.empty 100.168.192.in-addr.arpa
+nano 100.168.192.in-addr.arpa
+
+$TTL	3H
+@	IN	SOA	au-team.irpo. au-team.irpo. (
+			0		; serial
+			1D		; refresh
+			1H		; retry
+			1W	 	; expire
+			3H )		; minimum
+	NS	hq-srv.au-team.irpo.
+1	PTR	hq-rtr
+10	PTR	hq-srv
+___________________________________________________________
+
+cp /var/named/named.empty 200.168.192.in-addr.arpa 
+nano 200.168.192.in-addr.arpa 
+
+$TTL	3H 
+@	IN	SOA	au-team.irpo. au-team.irpo. (
+			0	; serial
+			1D	; refresh
+			1H	; retry
+			1W	; expire
+			3H )	; minimum
+	NS	hq-srv.au-team.irpo.
+1 	PTR 	hq-rtr
+2	PTR	hq-cli
+________________________________________________________________
+
+chmod -R 777 /opt/dns 
+ПРОВЕРЯЕМ КОНФИГУРАЦИЮ И ИСПРАВЛЯЕМ ОШИБКИ ЕСЛИ ЕСТЬ 
+named-checkconf -z 
+systemctl restart named
+_________________________________________________________________
+
+После этого переходим на hq-cli. Нажимаем на кнопку подключений 
+(между сменой языка и уровнем громкости), нажимаем на стрелочку рядом 
+со словом «Проводное» и выбираем настройки подключения,  переходим на вкладку IPv4  Выключаем автоматический ДНС и указываем 192.168.100.10
+
+ПРОВЕРЯЕМ РАБОТОСПОБНОСТЬ 
+ping br-rtr 
+ping br-srv 
+ping hq-rtr 
+ping hq-srv 
+ping ya.ru
+_____________________________________________________________________
+
+заходим в nmtui на другие машины и меняем ДНС сервер с 
+10.39.0.1 на 192.168.100.10. Так же указываем домен поиска au-team.irpo. 
+После этого в nmtui переходим на вкладку «Активировать 
+подключение». Выключаем и включаем интерфейс, на который ставили ДНС. 
+_____________________________________________________________________
+
+11.УСТАНОВКА ЧАСОВГО ПОЯСА
+
+timedatectl set-timezone Europe/Moscow
+timedatectl 
+
+
+222222222
+
+HQ-SRV
+systemctl restart named
+1. Устанавливаем Samba на BR-SRV: 
+dnf install samba* krb5* 
+mv /etc/samba/smb.conf /etc/samba/smb.conf.bak 
+mv /etc/krb5.conf /etc/krb5.conf.bak 
+
+nano /etc/krb5.conf.d/crypto-policies
+курсор на 2 строчку, CTRL+K, затем х3 CTRL+U
+default_tgs_enctypes
+default_tkt_enctypes
+
+samba-tool domain provision --use-rfc2307 --interactive
+DNS backend - NONE
+
+cp /var/lib/samba/private/krb5.conf /etc/krb5.conf 
+
+nano /etc/krb5.conf 
+В realms добавляем kdc = br-srv.au-team.irpo
+
+systemctl enable --now samba
+
+kinit administrator@AU-TEAM.IRPO
+
+Переходим на HQ-CLI, переходим в root и пишем: 
+echo 172.30.100.10 au-team.irpo >> /etc/hosts 
+realm join -U -v Administrator@AU-TEAM.IRPO 
+
+Возвращаемся на BR-SRV. Далее создаем группу hq и добавляем в нее 
+всех созданных пользователей. 
+samba-tool group add hq 
+for i in {1..5}; do samba-tool user add user$i.hq P@ssw0rd; samba-tool group addmembers hq user$i.hq; done 
+Проверяем: 
+samba-tool group listmembers hq 
+
+Переходим на HQ-CLI 
+nano /etc/sssd/sssd.conf 
+Меняем значение ad_server на br-srv.au-team.irpo 
+systemctl restart sssd 
+
+nano /etc/krb5.conf
+[libdefaults]: убираем #
+[realms]: 
+AU-TEAM.IRPO = {
+	kdc = br-srv.au-team.irpo
+	admin_server = br-srv.au-team.irpo
+ }
+[domain_realm]:
+.au-team.irpo = AU-TEAM.IRPO
+au-team.irpo = AU-TEAM.IRPO
+
+«Настройки» - «Сетевые учетные записи». 
+Выбираем Kerberos, вводим administrator@AU-TEAM.IRPO и P@ssw0rd.  
+
+sss_cache -E 
+Перезапускаем HQ-CLI, снова вход в настройках
+Проверяем:  
+id user1.hq@AU-TEAM.IRPO 
+su - user1.hq@AU-TEAM.IRPO
+exit
+
+visudo 
+%hq@au-team.irpo ALL=(ALL) /bin/cat, /bin/grep, /bin/id
+Проверяем: 
+su – user1.hq@au-team.irpo
+sudo cat /etc/hosts | grep au-team
+id
+exit
+____________________________________________________________________________________________________________________
+____________________________________________________________________________________________________________________
+
+2. HQ-SRV add SATA 10,11,12
+lsblk
+fdisk  /dev/sdb
+g
+n
+Enter x3
+w
+так же для sdc и sdd
+
+mdadm --create --verbose /dev/md0 -l 5 -n 3 /dev/sd[b-d]1 
+Далее проверяем, в типе должно быть написано RAID5 
+
+mdadm --detail --scan --verbose >> /etc/mdadm.conf
+mkfs.ext4 /dev/md0
+mkdir /raid5
+nano /etc/fstab
+В конец добавляем следующую строчку: 
+/dev/md0	/raid5	ext4	defaults	0 0
+
+systemctl daemon-reload
+mount -a
+df -h
+
+dnf install nfs4-acl-tools
+mkdir /raid5/nfs
+chown nobody:nobody /raid5/nfs
+chmod 777 /raid5/nfs
+
+nano /etc/exports
+Добавляем в него следующую строчку: 
+/raid5/nfs    192.168.200.0/28 (rw) 
+exportfs -a
+systemctl enable --now nfs-server
+
+Переходим на HQ-CLI: 
+mkdir /mnt/nfs
+nano /etc/fstab
+Добавляем следующую строчку: 
+192.168.100.10:/raid5/nfs	/mnt/nfs	nfs	auto	0 0 
+mount -a
+df -h
+____________________________________________________________________________________________________________________
+____________________________________________________________________________________________________________________
+
+3. HQ-RTR
+nano /etc/chrony.conf 
+комментим дефолт сервера и ставим свой
+server 127.0.0.1 iburst prefer
+local stratum 5
+allow 0/0
+hwtimestamp *
+systemctl restart chronyd
+Проверяем: 
+chronyc sources 
+
+На HQ-SRV, HQ-CLI, BR-RTR, BR-SRV: 
+nano /etc/chrony.conf 
+Комментируем все сервера и добавляем созданный: 
+server 192.168.100.1 iburst prefer
+systemctl restart chronyd
+Проверка на HQ-SRV: chronyc sources 
+hq-rtr...
+____________________________________________________________________________________________________________________
+____________________________________________________________________________________________________________________
+
+4. BR-SRV 
+nano /etc/ansible/demo.yml
+VMs:
+hosts:
+  HQ-SRV:
+    ansible_host: 192.168.100.10
+    ansible_user: sshuser
+    ansible_port: 2024
+  HQ-CLI:
+    ansible_host: 192.168.200.2
+    ansible_user: username
+    ansible_port: 22
+  HQ-RTR:
+    ansible_host: 192.168.100.1
+    ansible_user: net_admin
+    ansible_port: 22
+  BR-RTR:
+    ansible_host: 172.30.100.1
+    ansible_user: net_admin
+    ansible_port: 22
+
+ssh-keygen -t rsa  
+Enter
+
+Далее копируем ключи. На вопрос с сохранием отпечатка пишем yes, 
+sshuser - P@ssw0rd
+username - P@ssw0rd
+net_admin - P@$$w0rd 
+
+ssh-copy-id -p 2024 sshuser@192.168.100.10
+ssh-copy-id username@192.168.200.2
+ssh-copy-id net_admin@192.168.100.1
+ssh-copy-id net_admin@172.30.100.1
+
+nano /etc/ansible/ansible.cfg
+[defaults]
+inventory = ./demo.yml
+ask_pass = False
+host_key_cheking = False
+interpreter_python=/usr/bin/python
+
+Проверяем настройку: 
+ansible -m ping all
+____________________________________________________________________________________________________________________
+____________________________________________________________________________________________________________________
+
+5. BR-SRV
+dnf install docker-ce docker-compose -y
+cd /home/username
+systemctl enable docker --now
+
+В браузере:
+mediawiki docker-compose
+раздел «Adding a Database Server»
+
+nano wiki.yml
+services:
+  MediaWiki:
+    container_name: wiki
+    image: mediawiki
+    restart: always
+    ports: 
+      - 8080:80
+    links:
+      - database
+    volumes:
+      - images:/var/www/html/images
+      # - ./LocalSettings.php:/var/www/html/LocalSettings.php
+  database:
+    container_name: mariadb
+    image: mariadb
+    environment:
+      MYSQL_DATABASE: mediawiki
+      MYSQL_USER: wiki
+      MYSQL_PASSWORD: WikiP@ssw0rd
+      MYSQL_RANDOM_ROOT_PASSWORD: 'yes'
+    volumes:
+      - dbvolume:/var/lib/mariadb
+volumes:
+  dbvolume:
+      external: true
+  images:
+пробел на 1 строчке убрать!
+
+docker volume create dbvolume
+docker-compose -f wiki.yml up -d
+Проверяем: 
+docker ps -a
+
+Переходим на клиента, заходим в браузер и вводим в адресную строку 
+172.30.100.10:8080. Далее нажимаем “set up the wiki”. Жмем далее до момента 
+ввода данных о БД. Заполняет данные о mariadb:
+
+Хост БД: mariadb
+mediawiki
+wiki
+WikiP@ssw0rd
+
+уствновка MediaWiki:
+Demo-Wiki
+wiki
+WikiP@ssw0rd
+WikiP@ssw0rd
+demo@demo.demo
+Хватит 
+
+scp -P 2024 /home/username/Загрузки/LocalSettings.php sshuser@172.30.100.10:/tmp
+
+После этого переходим на BR-SRV: 
+mv /tmp/LocalSettings.php /home/username
+nano wiki.yml
+Убираем комментарий со строчки.
+docker-compose -f wiki.yml stop
+docker-compose -f wiki.yml up -d
+
+Возвращаемся на клиента, переходим по адресу 172.30.100.10:8080 и 
+проверяем настроенное приложение. Входим в созданную учетную запись. 
+____________________________________________________________________________________________________________________
+____________________________________________________________________________________________________________________
+
+6. BR-RTR
+iptables -t nat -A PREROUTING -p tcp -m tcp -d 172.16.5.2/24 --dport 80 -j DNAT --to-destination 172.30.100.10:8080
+iptables -t nat -A PREROUTING -p tcp -m tcp -d 172.16.5.2/24 --dport 2024 -j DNAT --to-destination 172.30.100.10:2024
+iptables-save > /etc/sysconfig/iptables
+После этого с клиента переходим по адресу 172.16.5.2, нас должно перевести на страницу с MediaWiki. 
+Проверяем порт 2024 по SSH: 
+ssh –p 2024 sshuser 172.16.5.2
+Подключить нас должно к BR-SRV
+
+HQ-RTR:
+iptables -t nat -A PREROUTING -p tcp -m tcp -d 172.16.4.2/28 --dport 2024 -j DNAT --to-destination 192.168.100.10:2024
+iptables-save > /etc/sysconfig/iptables
+Проверяем порт 2024 по SSH: 
+ssh –p 2024 sshuser@172.16.4.2
+Подключить нас должно к HQ-SRV
+
+7. HQ-SRV
+dnf install httpd mariadb mariadb-server php php-mysqlnd php-pdo php-gd php-mbstring php-zip php-intl php-soap
+nano /etc/php.ini
+На следующей строчке после [PHP] пишем 
+max_input_vars=6000
+systemctl enable --now httpd php-fpm mariadb
+systemctl restart httpd php-fpm mariadb
+mysql_secure_installation
+Пишем пароль для рута - P@ssw0rd. На все остальные вопросы 
+отвечаем Yes. 
+
+mysql -u root -p 
+CREATE DATABASE moodledb DEFAULT CHARACTER SET utf8; 
+CREATE USER moodle@localhost IDENTIFIED BY ‘P@ssw0rd’; 
+GRANT ALL ON moodledb.* TO 'moodle'@'localhost'; 
+flush privileges; 
+quit; 
+systemctl restart mariadb
+
+Далее переходим на сайт moodle.org, в раздел Downloads и скачиваем tgz и коппируем адрес ссылки
+
+wget https://packaging.moodle.org/stable405/moodle-latest-5.0.tgz
+tar -xzf moodle-latest-5.0.tgz
+mv moodle/* /var/www/html
+chown -R apache:apache /var/www/html
+chmod -R 0777 /var/www/html
+mkdir /var/moodledata
+chown -R apache:apache /var/moodledata
+chmod -R 0777 /var/moodledata
+systemctl restart httpd
+
+После этого переходим на клиента и вводим в адресной 192.168.100.1 и 
+продолжаем установку. 
+если не робит то:
+dnf install php82-release
+dnf makecache
+dnf update php
+systemctl restart php-fpm
+setenforse 0
+Каталог данный указываем /var/moodledata
+
+localhost
+moodledb
+moodle
+P@ssw0rd
+mdl_
+
+Логин admin
+P@ssw0rd
+Администратор
+Пользователь
+demo@demo.demo
+
+10.39.0.146
+146
+demo@demo.demo
+____________________________________________________________________________________________________________________
+____________________________________________________________________________________________________________________
+
+8. HQ-RTR
+dnf install nginx
+systemctl enable --now nginx
+
+nano /etc/nginx/nginx.conf
+В файле комментируем созданный по умолчанию сервер и добавляем 
+в него 2 других
+
+server {
+	listen 80;
+	server_name moodle.au-team.irpo;
+	location / {
+		proxy_pass http://192.168.100.10:80;
+	}
+}
+
+server {
+	listen 80;
+	server_name wiki.au-team.irpo;
+	location / {
+		proxy_pass http://172.30.100.10:8080;
+	}
+}
+}
+
+systemctl restart nginx
+
+Идем на клиента и в адресной строке пишем http://wiki.au-team.irpo и 
+http://moodle.au-team.irpo. Нас должно перенаправлять на сайты. 
+
+Заходим в «Окно настройки РЕДОС», переходим во вкладку 
+«Партнерские приложения» и нажимаем на Яндекс браузер. После 
+загрузки нажимаем на клавишу WIN и выбираем «Другие приложения». 
+Переходим на вторую страницу и запускаем браузер.
+
+
+
+
+
+
+
+
+
+</pre>
+</body>
+</html>
